@@ -1,5 +1,5 @@
 # ===========================================
-# Caption to Narration - ver.5.0 (最終修正版)
+# Caption to Narration - ver.5.1 (最終修正版)
 # ===========================================
 
 import streamlit as st
@@ -12,17 +12,53 @@ from google.genai.errors import APIError
 
 
 # ===============================================================
-# ▼▼▼ XML解析関数（この部分が今回の主な修正点です）▼▼▼
+# ▼▼▼ XML解析関連の関数群（デコード部分を根本的に修正）▼▼▼
 # ===============================================================
+
+def decode_premiere_text(base64_string):
+    """
+    Premiereのソーステキスト(Base64)をデコードし、テキスト部分を抽出する（堅牢版）。
+    フォント名に依存せず、意味のある文字列を正規表現で探索する。
+    """
+    try:
+        decoded_bytes = base64.b64decode(base64_string)
+        full_text = decoded_bytes.decode('utf-16-be', errors='ignore')
+        
+        # 制御文字やバイナリデータ以外の「意味のある文字列」を全て抽出する
+        # (日本語、英数字、一般的な記号などが対象)
+        potential_matches = re.findall(r'([^\x00-\x1F\x7F-\x9F]{2,})', full_text)
+        
+        if not potential_matches:
+            return ""
+
+        # 抽出した文字列から、明らかに本文ではないもの（フォント名など）を除外
+        filtered_matches = [
+            m.strip() for m in potential_matches 
+            if 'Pro-Regular' not in m and 'Premiere' not in m and 'KozMin' not in m
+        ]
+        
+        # フィルター後のリストに残った最後の要素が本文である可能性が極めて高い
+        if filtered_matches:
+            return filtered_matches[-1]
+        
+        # もしフィルターですべて消えてしまった場合の保険として、元のリストの最後を返す
+        if potential_matches:
+            return potential_matches[-1]
+
+    except Exception:
+        return ""
+    return ""
+
+
 def parse_premiere_xml(uploaded_file):
     """
-    アップロードされたXMLファイルを解析し、指定の3行フォーマットのテキストを生成する。(二段階解析・最終修正版)
+    XMLファイルを二段階で解析し、テロップ情報を抽出する。
     """
     try:
         tree = ET.parse(uploaded_file)
         root = tree.getroot()
 
-        # --- 一段階目: ハッシュとテキストのマッピング辞書を作成 ---
+        # 一段階目: XML全体からハッシュと本文の対応表を作成
         hash_to_text_map = {}
         for param in root.findall(".//parameter"):
             param_id_node = param.find("parameterid")
@@ -33,12 +69,11 @@ def parse_premiere_xml(uploaded_file):
                 if hash_node is not None and hash_node.text and value_node is not None and value_node.text:
                     text_hash = hash_node.text
                     if text_hash not in hash_to_text_map:
-                        base64_text = value_node.text
-                        decoded_text = decode_premiere_text(base64_text)
+                        decoded_text = decode_premiere_text(value_node.text)
                         if decoded_text:
                             hash_to_text_map[text_hash] = decoded_text
 
-        # --- 二段階目: クリップアイテムを巡回し、ハッシュを使ってテキストを割り当て ---
+        # 二段階目: 各クリップを巡回し、ハッシュを元に本文を割り当て
         output_blocks = []
         for clipitem in root.findall(".//clipitem"):
             start_node = clipitem.find("start")
@@ -52,13 +87,12 @@ def parse_premiere_xml(uploaded_file):
                     break
 
             if start_node is not None and end_node is not None and hash_node is not None and hash_node.text:
-                start_frames = int(start_node.text)
-                end_frames = int(end_node.text)
                 text_hash = hash_node.text
-                
                 narration_text = hash_to_text_map.get(text_hash)
 
                 if narration_text:
+                    start_frames = int(start_node.text)
+                    end_frames = int(end_node.text)
                     start_tc = frames_to_df_timecode(start_frames)
                     end_tc = frames_to_df_timecode(end_frames)
                     output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
@@ -72,8 +106,6 @@ def parse_premiere_xml(uploaded_file):
         return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
     except Exception as e:
         return f"予期せぬエラーが発生しました: {e}"
-
-# (これより下の関数は変更ありませんが、念のため全体を掲載します)
 
 def frames_to_df_timecode(total_frames, frame_rate=29.97):
     if total_frames < 0: return "00;00;00;00"
@@ -94,23 +126,12 @@ def frames_to_df_timecode(total_frames, frame_rate=29.97):
     hh = total_minutes // 60
     return f"{hh:02d};{mm:02d};{ss:02d};{ff:02d}"
 
-def decode_premiere_text(base64_string):
-    try:
-        decoded_bytes = base64.b64decode(base64_string)
-        decoded_text = decoded_bytes.decode('utf-16-be', errors='ignore')
-        match = re.search(r'KozMinPro-Regular\s*(.*)', decoded_text, re.DOTALL)
-        if match:
-            text = match.group(1).strip('\x00\r\n\t ')
-            clean_text_match = re.search(r'([^\x00-\x1f\x7f-\x9f]+)', text)
-            if clean_text_match:
-                return clean_text_match.group(1).strip()
-    except Exception:
-        return ""
-    return ""
 
+# ===============================================================
+# ▼▼▼ AIチェックとナレーション変換エンジン（変更なし）▼▼▼
+# ===============================================================
 def check_narration_with_gemini(narration_blocks, api_key):
-    if not api_key:
-        return "エラー：Gemini APIキーが設定されていません。Streamlit Secretsを確認してください。"
+    if not api_key: return "エラー：Gemini APIキーが設定されていません。"
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -253,21 +274,16 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
     return {"narration_script": "\n".join(output_lines), "ai_data": narration_blocks_for_ai, "start_times": block_start_times}
 
 # ===============================================================
-# ▼▼▼ Streamlit UI (変更なし) ▼▼▼
+# ▼▼▼ Streamlit UI（変更なし）▼▼▼
 # ===============================================================
 st.set_page_config(page_title="Syncraft", page_icon="📝", layout="wide")
-
 st.title('Syncraft')
 st.caption('　ナレーション原稿作成ツール with gemini(β)')
-
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-
 if "ai_result_cache" not in st.session_state: st.session_state["ai_result_cache"] = ""
 if "last_input_hash" not in st.session_state: st.session_state["last_input_hash"] = None
 if "input_text" not in st.session_state: st.session_state["input_text"] = ""
-
 st.markdown("""<style> textarea { font-size: 14px !important; } </style>""", unsafe_allow_html=True)
-
 placeholder_text = """ここにPremiereのテロップ情報をペーストするか、
 下のボタンからXMLファイルをアップロードしてください。
 【ペーストする場合の推奨フォーマット】
@@ -336,7 +352,7 @@ with col2_main:
                 highlight_indices = set()
                 ai_display_text = ""
                 if ai_check_flag:
-                    with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
+                    with st.spinner("Geminiが誤字脱-字をチェック中...数分お待ちください🙇"):
                         if not st.session_state.get("ai_result_cache"):
                             ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
                             st.session_state["ai_result_cache"] = ai_result_md

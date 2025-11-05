@@ -234,6 +234,7 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
         if add_blank_line and i < len(parsed_blocks) - 1: output_lines.append("")
     return {"narration_script": "\n".join(output_lines), "ai_data": narration_blocks_for_ai, "start_times": block_start_times}
 
+
 # ===============================================================
 # ▼▼▼ Streamlit UI ▼▼▼
 # ===============================================================
@@ -277,17 +278,12 @@ help_text = """
 
 # --- コールバック関数の定義 ---
 def on_upload_change():
-    """ファイルアップローダーの状態が変わった時に呼ばれるコールバック"""
+    """ファイルアップローダーのコールバック。XMLを解析してセッションステートを更新"""
     uploaded_file = st.session_state.get("xml_uploader")
     if uploaded_file:
-        # spinnerをここに移動
         with st.spinner("XMLファイルを解析中..."):
-            parsed_text = parse_premiere_xml(uploaded_file)
-            st.session_state["input_text"] = parsed_text
-
-def on_text_area_change():
-    """テキストエリアが手動で編集された時に呼ばれるコールバック"""
-    st.session_state["input_text"] = st.session_state.get("input_text_area", "")
+            # 解析結果をセッションステートに直接格納
+            st.session_state.input_text = parse_premiere_xml(uploaded_file)
 
 # --- UIレイアウト ---
 col1_main, col2_main = st.columns(2)
@@ -299,19 +295,20 @@ with col1_main:
         on_change=on_upload_change
     )
     
+    # テキストエリアはセッションステート 'input_text' に直接バインドする
+    # これにより、コールバックによる変更が自動的に反映される
     st.text_area(
         "　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
         height=420,
         placeholder=placeholder_text,
         help=help_text,
-        key="input_text_area",
-        on_change=on_text_area_change,
-        value=st.session_state["input_text"]
+        key="input_text" # セッションステートのキーとウィジェットのキーを一致させる
     )
 
 # --- キャッシュ管理 ---
-cur_hash = hash(st.session_state["input_text"].strip())
-if st.session_state["last_input_hash"] != cur_hash:
+# 参照するキーを 'input_text' に統一
+cur_hash = hash(st.session_state.get("input_text", "").strip())
+if st.session_state.get("last_input_hash") != cur_hash:
     st.session_state["ai_result_cache"] = ""
     st.session_state["last_input_hash"] = cur_hash
 
@@ -321,37 +318,34 @@ with col1_opt: n_force_insert = st.checkbox("Ｎ強制挿入", value=True)
 with col2_opt: mm_ss_colon = st.checkbox("ｍｍ：ｓｓ", value=False)
 with col3_opt: ai_check_flag = st.checkbox("誤字脱字チェック(β)", value=False)
 
-
-# ===============================================================
-# ▼▼▼ 修正ここから：変換実行と結果表示のロジックを改善 ▼▼▼
-# ===============================================================
+# --- 変換実行と結果表示 ---
+# 参照するキーを 'input_text' に統一
 current_input = st.session_state.get("input_text", "")
 
-# 常に右側の列のコンテナを確保
 with col2_main:
     if current_input:
-        # まず、左のテキストエリアの入力がXML解析からのエラーメッセージでないか確認
-        if current_input.strip().startswith("エラー："):
-            # XML解析エラーの場合、右側には変換処理を行わず、警告を表示
-            st.warning("XMLの解析でエラーが発生しました。左のテキストエリアのエラーメッセージを確認してください。")
-            st.text_area("変換結果", value="", height=500, disabled=True)
-        else:
-            # 正常なテキスト入力なので、変換処理を実行
-            try:
-                initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
+        # XML解析関数が返すエラーメッセージは左のエリアに表示されるので、
+        # ここでは変換関数が返すエラーをハンドリングする
+        try:
+            initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
+            narration_script = initial_result["narration_script"]
+
+            # 変換結果がエラーメッセージかどうかをチェック
+            if narration_script.strip().startswith("エラー："):
+                 st.text_area("変換結果", value=narration_script, height=500)
+            else:
                 ai_data = initial_result["ai_data"]
                 block_start_times = initial_result["start_times"]
                 highlight_indices = set()
                 ai_display_text = ""
 
-                if ai_check_flag and not initial_result["narration_script"].startswith("エラー："):
+                if ai_check_flag:
                     with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
                         if not st.session_state.get("ai_result_cache"):
                             ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
                             st.session_state["ai_result_cache"] = ai_result_md
-                    
                     ai_result_md = st.session_state.get("ai_result_cache", "")
-                    
+                    # (AI結果の表示ロジックは変更なし)
                     if ai_result_md and "問題ありませんでした" not in ai_result_md:
                         new_table_header = "| タイム | 修正提案 | 理由 |\n|---|---|---|"
                         new_table_rows = []
@@ -365,37 +359,24 @@ with col2_main:
                                         highlight_indices.add(index)
                                         start_time = block_start_times[index]
                                         new_table_rows.append(f"| {start_time} | {suggestion} | {reason} |")
-                                except (ValueError, IndexError):
-                                    continue
-                        
-                        if new_table_rows:
-                            ai_display_text = new_table_header + "\n" + "\n".join(new_table_rows)
-                        else:
-                            ai_display_text = "AIによる指摘事項はありませんでした。"
-                    else:
-                        ai_display_text = ai_result_md
+                                except (ValueError, IndexError): continue
+                        if new_table_rows: ai_display_text = new_table_header + "\n" + "\n".join(new_table_rows)
+                        else: ai_display_text = "AIによる指摘事項はありませんでした。"
+                    else: ai_display_text = ai_result_md
 
                 final_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon, highlight_indices)
-                
                 st.text_area("　変換完了！コピーしてお使いください", value=final_result["narration_script"], height=500)
                 
-                # AI校正結果はメインの列の外、下に表示
                 if ai_check_flag and ai_display_text:
                     st.markdown("---")
                     st.subheader("📝 AI校正チェック結果")
                     st.markdown(ai_display_text)
-
-            except Exception as e:
-                st.error(f"変換処理中に予期せぬエラーが発生しました: {e}")
-                st.text_area("変換結果", value="", height=500, disabled=True)
+        except Exception as e:
+            st.error(f"変換処理中に予期せぬエラーが発生しました: {e}")
+            st.text_area("変換結果", value="", height=500, disabled=True)
     else:
-        # 初期状態（入力が何もない場合）
         st.markdown('<div style="height: 500px;"></div>', unsafe_allow_html=True)
 
-# ===============================================================
-# ▲▲▲ 修正ここまで ▲▲▲
-# ===============================================================
-            
 # --- フッター ---
 st.markdown("---")
 st.markdown(
@@ -406,5 +387,4 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
 st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)

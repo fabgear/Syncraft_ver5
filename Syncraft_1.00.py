@@ -1,239 +1,3 @@
-# ===========================================
-# Caption to Narration - ver.4.1 (アップロード処理修正版)
-# ===========================================
-
-import streamlit as st
-import re
-import math
-import xml.etree.ElementTree as ET
-import base64
-
-# ▼▼▼ Gemini API 関連 ▼▼▼
-from google import genai
-from google.genai.errors import APIError
-
-
-# ===============================================================
-# ▼▼▼ Premiere Pro XML解析用の機能（変更なし）▼▼▼
-# ===============================================================
-
-def frames_to_df_timecode(total_frames, frame_rate=29.97):
-    if total_frames < 0: return "00;00;00;00"
-    frames_in_minute = 1798
-    frames_in_10_minutes = 17982
-    num_10_minute_chunks = total_frames // frames_in_10_minutes
-    remaining_frames = total_frames % frames_in_10_minutes
-    num_minute_chunks = remaining_frames // frames_in_minute
-    if num_minute_chunks == 10: num_minute_chunks = 9
-    dropped_frames = (18 * num_10_minute_chunks) + (2 * num_minute_chunks)
-    total_non_drop_frames = total_frames + dropped_frames
-    frame_rate_int = 30
-    ff = total_non_drop_frames % frame_rate_int
-    total_seconds = total_non_drop_frames // frame_rate_int
-    ss = total_seconds % 60
-    total_minutes = total_seconds // 60
-    mm = total_minutes % 60
-    hh = total_minutes // 60
-    return f"{hh:02d};{mm:02d};{ss:02d};{ff:02d}"
-
-def decode_premiere_text(base64_string):
-    try:
-        decoded_bytes = base64.b64decode(base64_string)
-        decoded_text = decoded_bytes.decode('utf-16-be', errors='ignore')
-        match = re.search(r'KozMinPro-Regular\s*(.*)', decoded_text, re.DOTALL)
-        if match:
-            text = match.group(1).strip('\x00\r\n\t ')
-            clean_text_match = re.search(r'([^\x00-\x1f\x7f-\x9f]+)', text)
-            if clean_text_match:
-                return clean_text_match.group(1).strip()
-    except Exception:
-        return ""
-    return ""
-
-def parse_premiere_xml(uploaded_file):
-    try:
-        tree = ET.parse(uploaded_file)
-        root = tree.getroot()
-        timebase_element = root.find(".//sequence/rate/timebase")
-        is_ntsc_element = root.find(".//sequence/rate/ntsc")
-        is_df = (timebase_element is not None and timebase_element.text == '30' and 
-                 is_ntsc_element is not None and is_ntsc_element.text.upper() == 'TRUE')
-        output_blocks = []
-        for clipitem in root.findall(".//clipitem"):
-            start_node = clipitem.find("start")
-            end_node = clipitem.find("end")
-            value_node = clipitem.find(".//parameter[parameterid='1']/value")
-            if start_node is not None and end_node is not None and value_node is not None:
-                start_frames = int(start_node.text)
-                end_frames = int(end_node.text)
-                base64_text = value_node.text
-                if is_df:
-                    start_tc = frames_to_df_timecode(start_frames)
-                    end_tc = frames_to_df_timecode(end_frames)
-                else:
-                    start_tc = frames_to_df_timecode(start_frames)
-                    end_tc = frames_to_df_timecode(end_frames)
-                narration_text = decode_premiere_text(base64_text)
-                if narration_text:
-                    output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
-        if not output_blocks:
-            return "エラー：XML内に解析可能なテロップデータが見つかりませんでした。"
-        return "\n\n".join(output_blocks)
-    except ET.ParseError:
-        return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
-    except Exception as e:
-        return f"予期せぬエラーが発生しました: {e}"
-
-# ===============================================================
-# ▼▼▼ AIチェックとナレーション変換エンジン（変更なし）▼▼▼
-# ===============================================================
-
-def check_narration_with_gemini(narration_blocks, api_key):
-    # (変更なしのため省略)
-    if not api_key:
-        return "エラー：Gemini APIキーが設定されていません。Streamlit Secretsを確認してください。"
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        formatted_text = "\n".join([f"No.{i+1}: {b['text']}" for i, b in enumerate(narration_blocks)])
-        prompt = f"""
-        あなたはプロの校正者です。以下のナレーション原稿の誤字脱字をチェックし、修正案を提示してください。
-        # 制約条件
-        - ナレーション特有の句読点やスペースは修正しない。
-        - 芸能人の名前は正しく校正する。
-        - 文末が不自然でも、意図的なものとして修正しない。
-        - 漢数字は使用せず、算用数字のままにする。
-        - 誤りがない場合は「問題ありませんでした。」とだけ出力する。
-        # 出力形式
-        - 誤りがある場合のみ、以下のMarkdownテーブル形式で出力する。
-        - 「No.」列には必ず元の番号を入れる。
-        - 「修正提案」列で誤字脱字を指摘する時は「○○ → △△」のようにどう間違ってるか明確に記載。
-        - 「理由」列は「〇〇の誤り」、「〇〇では？」のように簡潔に記載する。
-        【出力形式】
-        | No. | 修正提案 | 理由 |
-        |---|---|---|
-        | (番号) | (正しい単語・フレーズ) | (修正理由) |
-        【ナレーション原稿】
-        ---
-        {formatted_text}
-        ---
-        """
-        response = model.generate_content(prompt)
-        return getattr(response, "text", "") or ""
-    except APIError as e: return f"Gemini APIエラーが発生しました。詳細: {e}"
-    except Exception as e: return f"予期せぬエラー: {e}"
-
-def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=False, highlight_indices=None):
-    # (変更なしのため省略)
-    if highlight_indices is None: highlight_indices = set()
-    FRAME_RATE = 30.0; CONNECTION_THRESHOLD = 1.0 + (10.0 / FRAME_RATE)
-    to_zenkaku_num = str.maketrans('0123456789', '０１２３４５６７８９')
-    hankaku_symbols = '!@#$%&-+='; zenkaku_symbols = '！＠＃＄％＆－＋＝'
-    hankaku_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ' + hankaku_symbols
-    zenkaku_chars = 'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ０１２３４５６７８９　' + zenkaku_symbols
-    to_zenkaku_all = str.maketrans(hankaku_chars, zenkaku_chars)
-    to_hankaku_time = str.maketrans('０１２３４５６７８９：〜', '0123456789:~')
-    lines = text.strip().split('\n'); start_index = -1
-    time_pattern = r'(\d{2})[:;](\d{2})[:;](\d{2})[;.](\d{2})\s*-\s*(\d{2})[:;](\d{2})[:;](\d{2})[;.](\d{2})'
-    for i, line in enumerate(lines):
-        line_with_frames = re.sub(r'(\d{2}:\d{2}:\d{2})(?![:.]\d{2})', r'\1.00', line)
-        normalized_line = line_with_frames.strip().translate(to_hankaku_time).replace('~', '-')
-        if re.match(time_pattern, normalized_line): start_index = i; break
-    if start_index == -1: return {"narration_script": "エラー：変換可能なタイムコードが見つかりませんでした。", "ai_data": [], "start_times": []}
-    relevant_lines = lines[start_index:]; blocks = []; i = 0
-    while i < len(relevant_lines):
-        current_line = relevant_lines[i].strip()
-        if not current_line: i += 1; continue
-        line_with_frames = re.sub(r'(\d{2}:\d{2}:\d{2})(?![:.]\d{2})', r'\1.00', current_line)
-        normalized_line = line_with_frames.translate(to_hankaku_time).replace('~', '-')
-        if re.match(time_pattern, normalized_line):
-            time_val = current_line; text_lines = []; i += 1
-            while i < len(relevant_lines):
-                if not relevant_lines[i].strip(): break
-                next_line_with_frames = re.sub(r'(\d{2}:\d{2}:\d{2})(?![:.]\d{2})', r'\1.00', relevant_lines[i].strip())
-                next_normalized = next_line_with_frames.translate(to_hankaku_time).replace('~', '-')
-                if re.match(time_pattern, next_normalized): break
-                text_lines.append(relevant_lines[i]); i += 1
-            text_val = "\n".join(text_lines); blocks.append({'time': time_val, 'text': text_val})
-        else: i += 1
-    output_lines = []; narration_blocks_for_ai = []; parsed_blocks = []; block_start_times = []
-    for block in blocks:
-        line_with_frames = re.sub(r'(\d{2}:\d{2}:\d{2})(?![:.]\d{2})', r'\1.00', block['time'])
-        normalized_time_str = line_with_frames.translate(to_hankaku_time).replace('~', '-')
-        time_match = re.match(time_pattern, normalized_time_str)
-        if not time_match: continue
-        groups = time_match.groups()
-        start_hh, start_mm, start_ss, start_fr, end_hh, end_mm, end_ss, end_fr = [int(g or 0) for g in groups]
-        narration_blocks_for_ai.append({'time': block['time'].strip(), 'text': block['text'].strip()})
-        parsed_blocks.append({'start_hh': start_hh, 'start_mm': start_mm, 'start_ss': start_ss, 'start_fr': start_fr,'end_hh': end_hh, 'end_mm': end_mm, 'end_ss': end_ss, 'end_fr': end_fr,'text': block['text']})
-    previous_end_hh = None
-    for i, block in enumerate(parsed_blocks):
-        start_hh, start_mm, start_ss, start_fr = block['start_hh'], block['start_mm'], block['start_ss'], block['start_fr']
-        end_hh, end_mm, end_ss, end_fr = block['end_hh'], block['end_mm'], block['end_ss'], block['end_fr']
-        should_insert_h_marker = False; marker_hh_to_display = -1
-        if i == 0:
-            if start_hh > 0: should_insert_h_marker = True; marker_hh_to_display = start_hh
-            previous_end_hh = end_hh
-        else:
-            if start_hh < end_hh: should_insert_h_marker = True; marker_hh_to_display = end_hh
-            elif previous_end_hh is not None and start_hh > previous_end_hh: should_insert_h_marker = True; marker_hh_to_display = start_hh
-        if should_insert_h_marker: output_lines.append(""); output_lines.append(f"【{str(marker_hh_to_display).translate(to_zenkaku_num)}Ｈ】")
-        previous_end_hh = end_hh
-        total_seconds_in_minute_loop = (start_mm % 60) * 60 + start_ss
-        spacer = ""; is_half_time = False; base_time_str = ""
-        if 0 <= start_fr <= 9:
-            display_mm = (total_seconds_in_minute_loop // 60) % 60; display_ss = total_seconds_in_minute_loop % 60
-            base_time_str = f"{display_mm:02d}{display_ss:02d}"; spacer = "　　　"
-        elif 10 <= start_fr <= 22:
-            display_mm = (total_seconds_in_minute_loop // 60) % 60; display_ss = total_seconds_in_minute_loop % 60
-            base_time_str = f"{display_mm:02d}{display_ss:02d}"; spacer = "　　"; is_half_time = True
-        else:
-            total_seconds_in_minute_loop += 1
-            display_mm = (total_seconds_in_minute_loop // 60) % 60; display_ss = total_seconds_in_minute_loop % 60
-            base_time_str = f"{display_mm:02d}{display_ss:02d}"; spacer = "　　　"
-        colon_time_str = f"{base_time_str[:2]}：{base_time_str[2:]}" if mm_ss_colon_flag else base_time_str
-        formatted_start_time = f"{colon_time_str.translate(to_zenkaku_num)}半" if is_half_time else colon_time_str.translate(to_zenkaku_num)
-        block_start_times.append(formatted_start_time)
-        text_content = block['text'].strip(' \u3000'); speaker_symbol = ''; body = ''
-        if n_force_insert_flag:
-            speaker_symbol = 'Ｎ'
-            n_match = re.match(r'^[\s　]*[NnＮｎ](?:[\s　]*[：:])?(?![A-Za-z0-9])[\s　]*(.*)$', text_content, re.DOTALL)
-            if n_match: body = n_match.group(1)
-            else: body = text_content
-        else: speaker_symbol = ''; body = text_content
-        body = body.strip(' \u3000')
-        if not body: body = "※注意！本文なし！"
-        body = body.translate(to_zenkaku_all)
-        end_string = ""; add_blank_line = True
-        if i + 1 < len(parsed_blocks):
-            next_block = parsed_blocks[i+1]
-            end_total_seconds = (end_hh * 3600) + (end_mm * 60) + end_ss + (end_fr / FRAME_RATE)
-            next_start_total_seconds = (next_block['start_hh'] * 3600) + (next_block['start_mm'] * 60) + next_block['start_ss'] + (next_block['start_fr'] / FRAME_RATE)
-            if next_start_total_seconds - end_total_seconds < CONNECTION_THRESHOLD: add_blank_line = False
-        if add_blank_line:
-            adj_ss = end_ss; adj_mm = end_mm
-            if 0 <= end_fr <= 9: adj_ss = end_ss - 1
-            if adj_ss < 0: adj_ss = 59; adj_mm -= 1
-            adj_mm_display = adj_mm % 60
-            if start_hh != end_hh or (start_mm % 60) != adj_mm_display: formatted_end_time = f"{adj_mm_display:02d}{adj_ss:02d}".translate(to_zenkaku_num)
-            else: formatted_end_time = f"{adj_ss:02d}".translate(to_zenkaku_num)
-            end_string = f" ／{formatted_end_time}"
-        line_prefix = "🔴" if i in highlight_indices else ""
-        body_lines = body.split('\n')
-        first_line_prefix_parts = [formatted_start_time, spacer]
-        if speaker_symbol: first_line_prefix_parts.append(f"{speaker_symbol}　")
-        first_line_prefix = "".join(first_line_prefix_parts)
-        indent_space = '　' * len(first_line_prefix)
-        first_line_text = body_lines[0].lstrip(' \u3000')
-        end_string_for_first_line = end_string if len(body_lines) == 1 else ""
-        output_lines.append(f"{line_prefix}{first_line_prefix}{first_line_text}{end_string_for_first_line}")
-        if len(body_lines) > 1:
-            for k, line_text in enumerate(body_lines[1:]):
-                end_string_for_this_line = end_string if k == len(body_lines) - 2 else ""
-                output_lines.append(f"{indent_space}{line_text.lstrip(' \\u3000')}{end_string_for_this_line}")
-        if add_blank_line and i < len(parsed_blocks) - 1: output_lines.append("")
-    return {"narration_script": "\n".join(output_lines), "ai_data": narration_blocks_for_ai, "start_times": block_start_times}
-
 # ===============================================================
 # ▼▼▼ Streamlit UI ▼▼▼
 # ===============================================================
@@ -275,43 +39,40 @@ help_text = """
 ・サイトでxmlから変換したフォーマットも使えます
 """
 
-# ▼▼▼ UIロジックの修正ここから ▼▼▼
-
+# --- コールバック関数の定義 ---
 def on_upload_change():
     """ファイルアップローダーの状態が変わった時に呼ばれるコールバック"""
     uploaded_file = st.session_state.get("xml_uploader")
     if uploaded_file:
         with st.spinner("XMLファイルを解析中..."):
             parsed_text = parse_premiere_xml(uploaded_file)
-            st.session_state["input_text"] = parsed_text # セッションステートを直接更新
+            st.session_state["input_text"] = parsed_text
 
 def on_text_area_change():
     """テキストエリアが手動で編集された時に呼ばれるコールバック"""
     st.session_state["input_text"] = st.session_state.get("input_text_area", "")
 
-
+# --- UIレイアウト ---
 col1_main, col2_main = st.columns(2)
 with col1_main:
     # XMLアップローダー
-    uploaded_file = st.file_uploader(
+    st.file_uploader(
         "Premiere ProのシーケンスXML (.xml) をアップロード",
         type=['xml'],
-        key="xml_uploader", # ウィジェットにキーを割り当て
-        on_change=on_upload_change # 変更時にコールバックを呼ぶ
+        key="xml_uploader",
+        on_change=on_upload_change
     )
     
     # テキストエリア
-    input_text = st.text_area(
-        label="　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
+    st.text_area(
+        "　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
         height=420,
         placeholder=placeholder_text,
         help=help_text,
-        key="input_text_area", # ウィジェットにキーを割り当て
-        on_change=on_text_area_change, # 変更時にコールバックを呼ぶ
-        value=st.session_state["input_text"] # 表示する値はセッションステートから
+        key="input_text_area",
+        on_change=on_text_area_change,
+        value=st.session_state["input_text"]
     )
-
-# ▲▲▲ UIロジックの修正ここまで ▲▲▲
 
 # --- キャッシュ管理 ---
 cur_hash = hash(st.session_state["input_text"].strip())
@@ -319,13 +80,13 @@ if st.session_state["last_input_hash"] != cur_hash:
     st.session_state["ai_result_cache"] = ""
     st.session_state["last_input_hash"] = cur_hash
 
-# --- 3段目：コントロールエリア ---
+# --- コントロールエリア ---
 col1_opt, col2_opt, col3_opt, _ = st.columns([1.5, 1.5, 3, 7.5]) 
 with col1_opt: n_force_insert = st.checkbox("Ｎ強制挿入", value=True)
 with col2_opt: mm_ss_colon = st.checkbox("ｍｍ：ｓｓ", value=False)
 with col3_opt: ai_check_flag = st.checkbox("誤字脱字チェック(β)", value=False)
 
-# --- 4段目：変換実行と結果表示 ---
+# --- 変換実行と結果表示 ---
 if st.session_state["input_text"]:
     try:
         current_input = st.session_state["input_text"]
@@ -388,23 +149,4 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)```
-
-### 改善点と動作の流れ
-
-1.  **`st.session_state["input_text"]` を唯一の情報源に**: アプリケーション内で扱う「入力テキスト」は、このセッションステート変数が常に最新の状態を保持します。
-2.  **`on_upload_change` コールバック**:
-    *   `st.file_uploader`の `on_change` 引数にこの関数を指定しました。
-    *   ファイルがアップロードされると**即座に**この関数が実行されます。
-    *   関数内でXMLを解析し、結果を`st.session_state["input_text"]`に書き込みます。
-    *   Streamlitはセッションステートの変更を検知し、アプリ全体を再実行（リロード）します。
-3.  **`on_text_area_change` コールバック**:
-    *   `st.text_area`にも `on_change` を設定しました。
-    *   ユーザーがテキストエリアを**手動で編集**した場合に、その内容を`st.session_state["input_text"]`に書き戻します。これにより、アップロード後に追加で編集しても大丈夫です。
-4.  **`value=st.session_state["input_text"]`**:
-    *   テキストエリアが表示する内容は、常にセッションステートから取得するように `value` 引数で明示的に指定します。
-    *   これにより、コールバック関数によってセッションステートが更新された後、再実行された際にテキストエリアには必ず最新の内容が表示されます。
-
-この修正により、アップロード→解析→テキストエリアへの反映、という流れがスムーズかつ確実に実行されるはずです。
-
-再度お手数をおかけしますが、こちらのコードでお試しいただけますでしょうか。
+st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)

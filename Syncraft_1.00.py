@@ -1,13 +1,150 @@
 # ===========================================
-# Caption to Narration - 最終完成版 (ヘルプテキスト追加)
+# Caption to Narration - ver.4 (XMLアップロード機能追加)
 # ===========================================
 
 import streamlit as st
 import re
 import math
+import xml.etree.ElementTree as ET
+import base64
+
 # ▼▼▼ Gemini API 関連 ▼▼▼
 from google import genai
 from google.genai.errors import APIError
+
+
+# ===============================================================
+# ▼▼▼ 追加ここから：Premiere Pro XML解析用の新機能 ▼▼▼
+# ===============================================================
+
+def frames_to_df_timecode(total_frames, frame_rate=29.97):
+    """
+    フレーム数をドロップフレーム(DF)タイムコード 'HH;MM;SS;FF' に変換する。
+    Premiereの29.97fps NTSC設定に対応。
+    """
+    if total_frames < 0:
+        return "00;00;00;00"
+
+    # 1分あたりにドロップされるフレーム数 (2フレーム)
+    frames_in_minute = 1798 # (30 * 60) - 2
+    # 10分あたりのフレーム数（ドロップしない分を含む）
+    frames_in_10_minutes = 17982 # (1798 * 9) + (30 * 60)
+
+    num_10_minute_chunks = total_frames // frames_in_10_minutes
+    remaining_frames = total_frames % frames_in_10_minutes
+
+    num_minute_chunks = remaining_frames // frames_in_minute
+    # 10分ちょうどの場合の例外処理
+    if num_minute_chunks == 10:
+        num_minute_chunks = 9
+
+    # ドロップするフレームの総数を計算
+    # 10分ごとに18フレーム + 残りの分で2フレームずつドロップ
+    dropped_frames = (18 * num_10_minute_chunks) + (2 * num_minute_chunks)
+    
+    # ドロップ数を考慮した総フレーム数
+    total_non_drop_frames = total_frames + dropped_frames
+    
+    frame_rate_int = 30 # 計算用の整数フレームレート
+    
+    ff = total_non_drop_frames % frame_rate_int
+    total_seconds = total_non_drop_frames // frame_rate_int
+    ss = total_seconds % 60
+    total_minutes = total_seconds // 60
+    mm = total_minutes % 60
+    hh = total_minutes // 60
+
+    return f"{hh:02d};{mm:02d};{ss:02d};{ff:02d}"
+
+def decode_premiere_text(base64_string):
+    """
+    Premiereのソーステキスト(Base64)をデコードして、可読なテキスト部分を抽出する。
+    フォント情報などのバイナリデータの中から、UTF-16BEでエンコードされた本文を探す。
+    """
+    try:
+        decoded_bytes = base64.b64decode(base64_string)
+        # 多くの場合、テキストは'KozMinPro-Regular'のようなフォント名の後にある
+        # UTF-16BEでデコードを試み、読めない文字は無視する
+        decoded_text = decoded_bytes.decode('utf-16-be', errors='ignore')
+        
+        # フォント名の後から始まる意味のある文字列を探す
+        match = re.search(r'KozMinPro-Regular\s*(.*)', decoded_text, re.DOTALL)
+        if match:
+            # 不要な制御文字や空白をトリムして返す
+            text = match.group(1).strip('\x00\r\n\t ')
+            # 取得したテキストからさらに不要な部分を削る
+            clean_text_match = re.search(r'([^\x00-\x1f\x7f-\x9f]+)', text)
+            if clean_text_match:
+                return clean_text_match.group(1).strip()
+    except Exception:
+        # デコードに失敗した場合は空文字を返す
+        return ""
+    # 何も見つからなかった場合
+    return ""
+
+
+def parse_premiere_xml(uploaded_file):
+    """
+    アップロードされたXMLファイルを解析し、指定の3行フォーマットのテキストを生成する。
+    """
+    try:
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+        
+        # timebaseを取得 (通常は30)
+        timebase_element = root.find(".//sequence/rate/timebase")
+        is_ntsc_element = root.find(".//sequence/rate/ntsc")
+        
+        # NTSC(ドロップフレーム)かどうかの判定
+        is_df = (timebase_element is not None and timebase_element.text == '30' and 
+                 is_ntsc_element is not None and is_ntsc_element.text.upper() == 'TRUE')
+
+        output_blocks = []
+        # すべてのビデオクリップアイテムを検索
+        for clipitem in root.findall(".//clipitem"):
+            start_node = clipitem.find("start")
+            end_node = clipitem.find("end")
+            
+            # ソーステキストのパラメータを探す
+            value_node = clipitem.find(".//parameter[parameterid='1']/value")
+
+            if start_node is not None and end_node is not None and value_node is not None:
+                start_frames = int(start_node.text)
+                end_frames = int(end_node.text)
+                
+                # Base64エンコードされたテキストを取得
+                base64_text = value_node.text
+                
+                # フレーム数をタイムコードに変換
+                if is_df:
+                    start_tc = frames_to_df_timecode(start_frames)
+                    end_tc = frames_to_df_timecode(end_frames)
+                else:
+                    # NTSCでない場合は単純計算（このコードではDFを前提とする）
+                    # 必要であればここに非DFの変換ロジックを追加
+                    start_tc = frames_to_df_timecode(start_frames)
+                    end_tc = frames_to_df_timecode(end_frames)
+
+                # Base64から本文をデコード
+                narration_text = decode_premiere_text(base64_text)
+
+                # テキストが空でなければブロックを追加
+                if narration_text:
+                    output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
+        
+        if not output_blocks:
+            return "エラー：XML内に解析可能なテロップデータが見つかりませんでした。"
+
+        return "\n\n".join(output_blocks)
+
+    except ET.ParseError:
+        return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
+    except Exception as e:
+        return f"予期せぬエラーが発生しました: {e}"
+
+# ===============================================================
+# ▲▲▲ 追加ここまで ▲▲▲
+# ===============================================================
 
 
 # ===============================================================
@@ -22,7 +159,8 @@ def check_narration_with_gemini(narration_blocks, api_key):
         return "エラー：Gemini APIキーが設定されていません。Streamlit Secretsを確認してください。"
 
     try:
-        client = genai.Client(api_key=api_key)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
         # AIに渡すテキストに番号を付与
         formatted_text = "\n".join([f"No.{i+1}: {b['text']}" for i, b in enumerate(narration_blocks)])
 
@@ -54,11 +192,7 @@ def check_narration_with_gemini(narration_blocks, api_key):
         ---
         """
 
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
+        response = model.generate_content(prompt)
         return getattr(response, "text", "") or ""
 
     except APIError as e:
@@ -191,7 +325,7 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
         formatted_start_time = f"{colon_time_str.translate(to_zenkaku_num)}半" if is_half_time else colon_time_str.translate(to_zenkaku_num)
         block_start_times.append(formatted_start_time)
         
-        ### ▼▼▼ 変更点：話者分離ロジックを最終修正 ▼▼▼
+        ### ▼▼▼ 話者分離ロジックを最終修正 ▼▼▼
         text_content = block['text'].strip(' \u3000')
         speaker_symbol = ''
         body = ''
@@ -260,69 +394,72 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
 # ===============================================================
 st.set_page_config(page_title="Syncraft", page_icon="📝", layout="wide")
 
-
-
 st.title('Syncraft')
 st.caption('　ナレーション原稿作成ツール with gemini(β)')
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
+# --- セッションステートの初期化 ---
 if "ai_result_cache" not in st.session_state: st.session_state["ai_result_cache"] = ""
 if "last_input_hash" not in st.session_state: st.session_state["last_input_hash"] = None
+# ▼▼▼ 追加 ▼▼▼
+if "input_text" not in st.session_state: st.session_state["input_text"] = ""
+# ▲▲▲ 追加 ▲▲▲
 
 st.markdown("""<style> textarea { font-size: 14px !important; } </style>""", unsafe_allow_html=True)
 
-# --- 1段目：タイトル ---
-#col1_top, col2_top = st.columns(2)
-#with col1_top: st.header('')
-#with col2_top: st.header('')
+placeholder_text = """ここにPremiereのテロップ情報をペーストするか、
+下のボタンからXMLファイルをアップロードしてください。
 
-# --- 2段目：メインのテキストエリア【変更】---
-# ▼▼▼ placeholderとhelp用のテキストを定義 ▼▼▼
-placeholder_text = """Supported Formats  
-  
-➤ Recommended:
+【ペーストする場合の推奨フォーマット】
 00;00;00;00 - 00;00;02;29
-Nああああ
-
-➤ Standard:
-００:００:１５　〜　００:００:１８
 Nああああ
 
 """
 
 help_text = """
-  
-【機能詳細】  
-・ENDタイムとH（時間）をまたぐ時の仕切り自動挿入　　
-・✅N強制挿入がONの場合、本文頭に自動で全角「Ｎ」が挿入されます　　
-　ＶＯや実況などの時は注意！　　
-・ナレーション本文の半角英数字は全て全角に変換されます　　
-・✅ｍｍ：ｓｓがONの場合タイムコードにコロンが入ります　　
-・✅誤字脱字チェックをONにするとAIが原稿の校正を行います　　
-　注意箇所には🔴がつきます　　
-　　
-【フォーマット】　　
-・Premiereのキャプションをテキストで書き出した形式が　　
-　半秒単位でタイムが出るのでオススメです　　
-・サイトでxmlから変換したフォーマットも使えます　　
+【機能詳細】
+・ENDタイムとH（時間）をまたぐ時の仕切り自動挿入
+・✅N強制挿入がONの場合、本文頭に自動で全角「Ｎ」が挿入されます
+　ＶＯや実況などの時は注意！
+・ナレーション本文の半角英数字は全て全角に変換されます
+・✅ｍｍ：ｓｓがONの場合タイムコードにコロンが入ります
+・✅誤字脱字チェックをONにするとAIが原稿の校正を行います
+　注意箇所には🔴がつきます
+
+【フォーマット】
+・Premiereのキャプションをテキストで書き出した形式が
+　半秒単位でタイムが出るのでオススメです
+・サイトでxmlから変換したフォーマットも使えます
 """
-# ▲▲▲ ここまで ▲▲▲
 
 col1_main, col2_main = st.columns(2)
 with col1_main:
-    # ▼▼▼ st.text_area に placeholder と help を追加 ▼▼▼
-    input_text = st.text_area(
-        label="　ここに元原稿をペーストして Ctrl+Enter を押してください。", 
-        height=500,
-        placeholder=placeholder_text,
-        help=help_text
+    # ▼▼▼ 追加ここから：XMLアップローダー ▼▼▼
+    uploaded_file = st.file_uploader(
+        "Premiere ProのシーケンスXML (.xml) をアップロード",
+        type=['xml']
     )
-    # ▲▲▲ ここまで ▲▲▲
+    
+    # ファイルがアップロードされたら解析してテキストエリアを更新
+    if uploaded_file is not None:
+        with st.spinner("XMLファイルを解析中..."):
+            parsed_text = parse_premiere_xml(uploaded_file)
+            st.session_state["input_text"] = parsed_text # セッションステートを更新
+    # ▲▲▲ 追加ここまで ▲▲▲
 
+    # テキストエリアはセッションステートを元に表示・更新
+    input_text = st.text_area(
+        label="　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
+        height=420, # 高さを少し調整
+        placeholder=placeholder_text,
+        help=help_text,
+        key="input_text_area" # キーを追加して状態を管理
+    )
+    st.session_state["input_text"] = input_text # 手動編集もセッションステートに反映
 
 # --- キャッシュ管理 ---
-cur_hash = hash(input_text.strip())
+cur_hash = hash(st.session_state["input_text"].strip())
 if st.session_state["last_input_hash"] != cur_hash:
     st.session_state["ai_result_cache"] = ""
     st.session_state["last_input_hash"] = cur_hash
@@ -334,9 +471,10 @@ with col2_opt: mm_ss_colon = st.checkbox("ｍｍ：ｓｓ", value=False)
 with col3_opt: ai_check_flag = st.checkbox("誤字脱字チェック(β)", value=False)
 
 # --- 4段目：変換実行と結果表示 ---
-if input_text:
+if st.session_state["input_text"]: # 入力はセッションステートから取得
     try:
-        initial_result = convert_narration_script(input_text, n_force_insert, mm_ss_colon)
+        current_input = st.session_state["input_text"]
+        initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
         ai_data = initial_result["ai_data"]
         block_start_times = initial_result["start_times"]
 
@@ -374,7 +512,7 @@ if input_text:
             else:
                 ai_display_text = ai_result_md
 
-        final_result = convert_narration_script(input_text, n_force_insert, mm_ss_colon, highlight_indices)
+        final_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon, highlight_indices)
         
         with col2_main:
              st.text_area("　変換完了！コピーしてお使いください", value=final_result["narration_script"], height=500)
@@ -390,9 +528,8 @@ if input_text:
             st.text_area("　", value="", height=500, disabled=True)
 else:
     with col2_main:
-        st.markdown('<div style="height: 500px;"></div>', unsafe_allow_html=True)#ここ500pxです。いつも538と書いてくる
+        st.markdown('<div style="height: 500px;"></div>', unsafe_allow_html=True)
             
-# --- フッター ---
 # --- フッター ---
 st.markdown("---")
 st.markdown(
@@ -405,15 +542,3 @@ st.markdown(
 )
 
 st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)
-
-
-
-
-
-
-
-
-
-
-
-

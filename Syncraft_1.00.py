@@ -50,35 +50,59 @@ def decode_premiere_text(base64_string):
         return ""
     return ""
 
+# ===============================================================
+# ▼▼▼ 差し替え箇所：この関数全体を入れ替えてください ▼▼▼
+# ===============================================================
 def parse_premiere_xml(uploaded_file):
+    """
+    アップロードされたXMLファイルを解析し、指定の3行フォーマットのテキストを生成する。(修正版)
+    """
     try:
         tree = ET.parse(uploaded_file)
         root = tree.getroot()
+        
         timebase_element = root.find(".//sequence/rate/timebase")
         is_ntsc_element = root.find(".//sequence/rate/ntsc")
         is_df = (timebase_element is not None and timebase_element.text == '30' and 
                  is_ntsc_element is not None and is_ntsc_element.text.upper() == 'TRUE')
+
         output_blocks = []
+        # すべてのビデオクリップアイテムを検索
         for clipitem in root.findall(".//clipitem"):
             start_node = clipitem.find("start")
             end_node = clipitem.find("end")
-            value_node = clipitem.find(".//parameter[parameterid='1']/value")
-            if start_node is not None and end_node is not None and value_node is not None:
+            
+            # --- ▼▼▼ 修正ロジック ▼▼▼ ---
+            # 'ソーステキスト'のパラメータをより確実な方法で探す
+            value_node = None
+            # clipitem内の全ての<parameter>タグを一度取得する
+            for param in clipitem.findall(".//parameter"):
+                # <parameterid>が'1'のものを探す
+                param_id_node = param.find("parameterid")
+                if param_id_node is not None and param_id_node.text == '1':
+                    # IDが1なら、それがソーステキストなので<value>タグを取得
+                    value_node = param.find("value")
+                    # 見つかったのでループを抜ける
+                    break
+            # --- ▲▲▲ 修正ロジックここまで ▲▲▲
+
+            if start_node is not None and end_node is not None and value_node is not None and value_node.text:
                 start_frames = int(start_node.text)
                 end_frames = int(end_node.text)
                 base64_text = value_node.text
-                if is_df:
-                    start_tc = frames_to_df_timecode(start_frames)
-                    end_tc = frames_to_df_timecode(end_frames)
-                else:
-                    start_tc = frames_to_df_timecode(start_frames)
-                    end_tc = frames_to_df_timecode(end_frames)
+                
+                start_tc = frames_to_df_timecode(start_frames)
+                end_tc = frames_to_df_timecode(end_frames)
                 narration_text = decode_premiere_text(base64_text)
+
                 if narration_text:
                     output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
+        
         if not output_blocks:
             return "エラー：XML内に解析可能なテロップデータが見つかりませんでした。"
+
         return "\n\n".join(output_blocks)
+
     except ET.ParseError:
         return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
     except Exception as e:
@@ -388,3 +412,4 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)
+

@@ -1,5 +1,5 @@
 # ===========================================
-# Caption to Narration - ver.5.1 (最終修正版)
+# Caption to Narration - ver.5.2 (最終修正版)
 # ===========================================
 
 import streamlit as st
@@ -17,37 +17,39 @@ from google.genai.errors import APIError
 
 def decode_premiere_text(base64_string):
     """
-    Premiereのソーステキスト(Base64)をデコードし、テキスト部分を抽出する（堅牢版）。
-    フォント名に依存せず、意味のある文字列を正規表現で探索する。
+    Premiereのソーステキスト(Base64)をデコードし、テキスト部分を抽出する（最終修正版）。
+    バイナリデータの中からUTF-8でエンコードされた文字列を直接探し出す。
     """
     try:
         decoded_bytes = base64.b64decode(base64_string)
-        full_text = decoded_bytes.decode('utf-16-be', errors='ignore')
         
-        # 制御文字やバイナリデータ以外の「意味のある文字列」を全て抽出する
-        # (日本語、英数字、一般的な記号などが対象)
-        potential_matches = re.findall(r'([^\x00-\x1F\x7F-\x9F]{2,})', full_text)
+        # Premiereのデータ構造では、テキストは多くの場合、特定のバイト列の後に出現する
+        # ここでは、意味のあるUTF-8文字列の開始点を探す
+        # 日本語の多くは3バイトで構成されるため、それらしいバイト列を探す
         
-        if not potential_matches:
-            return ""
-
-        # 抽出した文字列から、明らかに本文ではないもの（フォント名など）を除外
-        filtered_matches = [
-            m.strip() for m in potential_matches 
-            if 'Pro-Regular' not in m and 'Premiere' not in m and 'KozMin' not in m
-        ]
+        # 最も長いUTF-8として解釈できるバイトシーケンスを探す
+        longest_text = ""
+        # バイト列を少しずつずらしながらデコードを試みる
+        for i in range(len(decoded_bytes)):
+            try:
+                # i番目のバイトから末尾までをUTF-8としてデコード試行
+                chunk = decoded_bytes[i:]
+                text = chunk.decode('utf-8', errors='strict')
+                
+                # デコード成功後、不要な制御文字などを除去
+                clean_text = re.sub(r'[\x00-\x1F\x7F-\x9F]+', '', text).strip()
+                
+                # 最も長いものを本文として採用する
+                if len(clean_text) > len(longest_text):
+                    longest_text = clean_text
+            except UnicodeDecodeError:
+                # デコードに失敗した場合は次のバイトへ
+                continue
         
-        # フィルター後のリストに残った最後の要素が本文である可能性が極めて高い
-        if filtered_matches:
-            return filtered_matches[-1]
-        
-        # もしフィルターですべて消えてしまった場合の保険として、元のリストの最後を返す
-        if potential_matches:
-            return potential_matches[-1]
+        return longest_text
 
     except Exception:
         return ""
-    return ""
 
 
 def parse_premiere_xml(uploaded_file):
@@ -58,7 +60,6 @@ def parse_premiere_xml(uploaded_file):
         tree = ET.parse(uploaded_file)
         root = tree.getroot()
 
-        # 一段階目: XML全体からハッシュと本文の対応表を作成
         hash_to_text_map = {}
         for param in root.findall(".//parameter"):
             param_id_node = param.find("parameterid")
@@ -73,7 +74,6 @@ def parse_premiere_xml(uploaded_file):
                         if decoded_text:
                             hash_to_text_map[text_hash] = decoded_text
 
-        # 二段階目: 各クリップを巡回し、ハッシュを元に本文を割り当て
         output_blocks = []
         for clipitem in root.findall(".//clipitem"):
             start_node = clipitem.find("start")
@@ -126,10 +126,6 @@ def frames_to_df_timecode(total_frames, frame_rate=29.97):
     hh = total_minutes // 60
     return f"{hh:02d};{mm:02d};{ss:02d};{ff:02d}"
 
-
-# ===============================================================
-# ▼▼▼ AIチェックとナレーション変換エンジン（変更なし）▼▼▼
-# ===============================================================
 def check_narration_with_gemini(narration_blocks, api_key):
     if not api_key: return "エラー：Gemini APIキーが設定されていません。"
     try:
@@ -274,7 +270,7 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
     return {"narration_script": "\n".join(output_lines), "ai_data": narration_blocks_for_ai, "start_times": block_start_times}
 
 # ===============================================================
-# ▼▼▼ Streamlit UI（変更なし）▼▼▼
+# ▼▼▼ Streamlit UI（テキストボックスの高さを修正）▼▼▼
 # ===============================================================
 st.set_page_config(page_title="Syncraft", page_icon="📝", layout="wide")
 st.title('Syncraft')
@@ -321,7 +317,7 @@ with col1_main:
     )
     st.text_area(
         "　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
-        height=420,
+        height=500, # <-- 高さを500pxに修正
         placeholder=placeholder_text,
         help=help_text,
         key="input_text"
@@ -352,7 +348,7 @@ with col2_main:
                 highlight_indices = set()
                 ai_display_text = ""
                 if ai_check_flag:
-                    with st.spinner("Geminiが誤字脱-字をチェック中...数分お待ちください🙇"):
+                    with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
                         if not st.session_state.get("ai_result_cache"):
                             ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
                             st.session_state["ai_result_cache"] = ai_result_md

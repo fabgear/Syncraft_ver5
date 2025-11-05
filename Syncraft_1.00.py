@@ -1,5 +1,5 @@
 # ===========================================
-# Caption to Narration - ver.4.1 (アップロード処理修正版)
+# Caption to Narration - ver.5.0 (最終修正版)
 # ===========================================
 
 import streamlit as st
@@ -7,15 +7,73 @@ import re
 import math
 import xml.etree.ElementTree as ET
 import base64
-
-# ▼▼▼ Gemini API 関連 ▼▼▼
 from google import genai
 from google.genai.errors import APIError
 
 
 # ===============================================================
-# ▼▼▼ Premiere Pro XML解析用の機能（変更なし）▼▼▼
+# ▼▼▼ XML解析関数（この部分が今回の主な修正点です）▼▼▼
 # ===============================================================
+def parse_premiere_xml(uploaded_file):
+    """
+    アップロードされたXMLファイルを解析し、指定の3行フォーマットのテキストを生成する。(二段階解析・最終修正版)
+    """
+    try:
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+
+        # --- 一段階目: ハッシュとテキストのマッピング辞書を作成 ---
+        hash_to_text_map = {}
+        for param in root.findall(".//parameter"):
+            param_id_node = param.find("parameterid")
+            if param_id_node is not None and param_id_node.text == '1':
+                hash_node = param.find("hash")
+                value_node = param.find("value")
+                
+                if hash_node is not None and hash_node.text and value_node is not None and value_node.text:
+                    text_hash = hash_node.text
+                    if text_hash not in hash_to_text_map:
+                        base64_text = value_node.text
+                        decoded_text = decode_premiere_text(base64_text)
+                        if decoded_text:
+                            hash_to_text_map[text_hash] = decoded_text
+
+        # --- 二段階目: クリップアイテムを巡回し、ハッシュを使ってテキストを割り当て ---
+        output_blocks = []
+        for clipitem in root.findall(".//clipitem"):
+            start_node = clipitem.find("start")
+            end_node = clipitem.find("end")
+            
+            hash_node = None
+            for param in clipitem.findall(".//parameter"):
+                param_id_node = param.find("parameterid")
+                if param_id_node is not None and param_id_node.text == '1':
+                    hash_node = param.find("hash")
+                    break
+
+            if start_node is not None and end_node is not None and hash_node is not None and hash_node.text:
+                start_frames = int(start_node.text)
+                end_frames = int(end_node.text)
+                text_hash = hash_node.text
+                
+                narration_text = hash_to_text_map.get(text_hash)
+
+                if narration_text:
+                    start_tc = frames_to_df_timecode(start_frames)
+                    end_tc = frames_to_df_timecode(end_frames)
+                    output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
+        
+        if not output_blocks:
+            return "エラー：XML内に解析可能なテロップデータが見つかりませんでした。ファイル形式が異なる可能性があります。"
+
+        return "\n\n".join(output_blocks)
+
+    except ET.ParseError:
+        return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
+    except Exception as e:
+        return f"予期せぬエラーが発生しました: {e}"
+
+# (これより下の関数は変更ありませんが、念のため全体を掲載します)
 
 def frames_to_df_timecode(total_frames, frame_rate=29.97):
     if total_frames < 0: return "00;00;00;00"
@@ -50,70 +108,7 @@ def decode_premiere_text(base64_string):
         return ""
     return ""
 
-# ===============================================================
-# ▼▼▼ 差し替え箇所：この関数全体を入れ替えてください ▼▼▼
-# ===============================================================
-def parse_premiere_xml(uploaded_file):
-    """
-    アップロードされたXMLファイルを解析し、指定の3行フォーマットのテキストを生成する。(修正版)
-    """
-    try:
-        tree = ET.parse(uploaded_file)
-        root = tree.getroot()
-        
-        timebase_element = root.find(".//sequence/rate/timebase")
-        is_ntsc_element = root.find(".//sequence/rate/ntsc")
-        is_df = (timebase_element is not None and timebase_element.text == '30' and 
-                 is_ntsc_element is not None and is_ntsc_element.text.upper() == 'TRUE')
-
-        output_blocks = []
-        # すべてのビデオクリップアイテムを検索
-        for clipitem in root.findall(".//clipitem"):
-            start_node = clipitem.find("start")
-            end_node = clipitem.find("end")
-            
-            # --- ▼▼▼ 修正ロジック ▼▼▼ ---
-            # 'ソーステキスト'のパラメータをより確実な方法で探す
-            value_node = None
-            # clipitem内の全ての<parameter>タグを一度取得する
-            for param in clipitem.findall(".//parameter"):
-                # <parameterid>が'1'のものを探す
-                param_id_node = param.find("parameterid")
-                if param_id_node is not None and param_id_node.text == '1':
-                    # IDが1なら、それがソーステキストなので<value>タグを取得
-                    value_node = param.find("value")
-                    # 見つかったのでループを抜ける
-                    break
-            # --- ▲▲▲ 修正ロジックここまで ▲▲▲
-
-            if start_node is not None and end_node is not None and value_node is not None and value_node.text:
-                start_frames = int(start_node.text)
-                end_frames = int(end_node.text)
-                base64_text = value_node.text
-                
-                start_tc = frames_to_df_timecode(start_frames)
-                end_tc = frames_to_df_timecode(end_frames)
-                narration_text = decode_premiere_text(base64_text)
-
-                if narration_text:
-                    output_blocks.append(f"{start_tc} - {end_tc}\n{narration_text}")
-        
-        if not output_blocks:
-            return "エラー：XML内に解析可能なテロップデータが見つかりませんでした。"
-
-        return "\n\n".join(output_blocks)
-
-    except ET.ParseError:
-        return "エラー：XMLファイルの解析に失敗しました。ファイルが破損しているか、形式が正しくありません。"
-    except Exception as e:
-        return f"予期せぬエラーが発生しました: {e}"
-
-# ===============================================================
-# ▼▼▼ AIチェックとナレーション変換エンジン（変更なし）▼▼▼
-# ===============================================================
-
 def check_narration_with_gemini(narration_blocks, api_key):
-    # (変更なしのため省略)
     if not api_key:
         return "エラー：Gemini APIキーが設定されていません。Streamlit Secretsを確認してください。"
     try:
@@ -148,7 +143,6 @@ def check_narration_with_gemini(narration_blocks, api_key):
     except Exception as e: return f"予期せぬエラー: {e}"
 
 def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=False, highlight_indices=None):
-    # (変更なしのため省略)
     if highlight_indices is None: highlight_indices = set()
     FRAME_RATE = 30.0; CONNECTION_THRESHOLD = 1.0 + (10.0 / FRAME_RATE)
     to_zenkaku_num = str.maketrans('0123456789', '０１２３４５６７８９')
@@ -258,9 +252,8 @@ def convert_narration_script(text, n_force_insert_flag=True, mm_ss_colon_flag=Fa
         if add_blank_line and i < len(parsed_blocks) - 1: output_lines.append("")
     return {"narration_script": "\n".join(output_lines), "ai_data": narration_blocks_for_ai, "start_times": block_start_times}
 
-
 # ===============================================================
-# ▼▼▼ Streamlit UI ▼▼▼
+# ▼▼▼ Streamlit UI (変更なし) ▼▼▼
 # ===============================================================
 st.set_page_config(page_title="Syncraft", page_icon="📝", layout="wide")
 
@@ -269,7 +262,6 @@ st.caption('　ナレーション原稿作成ツール with gemini(β)')
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# --- セッションステートの初期化 ---
 if "ai_result_cache" not in st.session_state: st.session_state["ai_result_cache"] = ""
 if "last_input_hash" not in st.session_state: st.session_state["last_input_hash"] = None
 if "input_text" not in st.session_state: st.session_state["input_text"] = ""
@@ -278,12 +270,10 @@ st.markdown("""<style> textarea { font-size: 14px !important; } </style>""", uns
 
 placeholder_text = """ここにPremiereのテロップ情報をペーストするか、
 下のボタンからXMLファイルをアップロードしてください。
-
 【ペーストする場合の推奨フォーマット】
 00;00;00;00 - 00;00;02;29
 Nああああ
 """
-
 help_text = """
 【機能詳細】
 ・ENDタイムとH（時間）をまたぐ時の仕切り自動挿入
@@ -293,23 +283,18 @@ help_text = """
 ・✅ｍｍ：ｓｓがONの場合タイムコードにコロンが入ります
 ・✅誤字脱字チェックをONにするとAIが原稿の校正を行います
 　注意箇所には🔴がつきます
-
 【フォーマット】
 ・Premiereのキャプションをテキストで書き出した形式が
 　半秒単位でタイムが出るのでオススメです
 ・サイトでxmlから変換したフォーマットも使えます
 """
 
-# --- コールバック関数の定義 ---
 def on_upload_change():
-    """ファイルアップローダーのコールバック。XMLを解析してセッションステートを更新"""
     uploaded_file = st.session_state.get("xml_uploader")
     if uploaded_file:
         with st.spinner("XMLファイルを解析中..."):
-            # 解析結果をセッションステートに直接格納
             st.session_state.input_text = parse_premiere_xml(uploaded_file)
 
-# --- UIレイアウト ---
 col1_main, col2_main = st.columns(2)
 with col1_main:
     st.file_uploader(
@@ -318,43 +303,31 @@ with col1_main:
         key="xml_uploader",
         on_change=on_upload_change
     )
-    
-    # テキストエリアはセッションステート 'input_text' に直接バインドする
-    # これにより、コールバックによる変更が自動的に反映される
     st.text_area(
         "　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
         height=420,
         placeholder=placeholder_text,
         help=help_text,
-        key="input_text" # セッションステートのキーとウィジェットのキーを一致させる
+        key="input_text"
     )
 
-# --- キャッシュ管理 ---
-# 参照するキーを 'input_text' に統一
 cur_hash = hash(st.session_state.get("input_text", "").strip())
 if st.session_state.get("last_input_hash") != cur_hash:
     st.session_state["ai_result_cache"] = ""
     st.session_state["last_input_hash"] = cur_hash
 
-# --- コントロールエリア ---
 col1_opt, col2_opt, col3_opt, _ = st.columns([1.5, 1.5, 3, 7.5]) 
 with col1_opt: n_force_insert = st.checkbox("Ｎ強制挿入", value=True)
 with col2_opt: mm_ss_colon = st.checkbox("ｍｍ：ｓｓ", value=False)
 with col3_opt: ai_check_flag = st.checkbox("誤字脱字チェック(β)", value=False)
 
-# --- 変換実行と結果表示 ---
-# 参照するキーを 'input_text' に統一
 current_input = st.session_state.get("input_text", "")
 
 with col2_main:
     if current_input:
-        # XML解析関数が返すエラーメッセージは左のエリアに表示されるので、
-        # ここでは変換関数が返すエラーをハンドリングする
         try:
             initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
             narration_script = initial_result["narration_script"]
-
-            # 変換結果がエラーメッセージかどうかをチェック
             if narration_script.strip().startswith("エラー："):
                  st.text_area("変換結果", value=narration_script, height=500)
             else:
@@ -362,14 +335,12 @@ with col2_main:
                 block_start_times = initial_result["start_times"]
                 highlight_indices = set()
                 ai_display_text = ""
-
                 if ai_check_flag:
                     with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
                         if not st.session_state.get("ai_result_cache"):
                             ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
                             st.session_state["ai_result_cache"] = ai_result_md
                     ai_result_md = st.session_state.get("ai_result_cache", "")
-                    # (AI結果の表示ロジックは変更なし)
                     if ai_result_md and "問題ありませんでした" not in ai_result_md:
                         new_table_header = "| タイム | 修正提案 | 理由 |\n|---|---|---|"
                         new_table_rows = []
@@ -387,10 +358,8 @@ with col2_main:
                         if new_table_rows: ai_display_text = new_table_header + "\n" + "\n".join(new_table_rows)
                         else: ai_display_text = "AIによる指摘事項はありませんでした。"
                     else: ai_display_text = ai_result_md
-
                 final_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon, highlight_indices)
                 st.text_area("　変換完了！コピーしてお使いください", value=final_result["narration_script"], height=500)
-                
                 if ai_check_flag and ai_display_text:
                     st.markdown("---")
                     st.subheader("📝 AI校正チェック結果")
@@ -400,8 +369,7 @@ with col2_main:
             st.text_area("変換結果", value="", height=500, disabled=True)
     else:
         st.markdown('<div style="height: 500px;"></div>', unsafe_allow_html=True)
-
-# --- フッター ---
+            
 st.markdown("---")
 st.markdown(
     """
@@ -412,4 +380,3 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.markdown('<div style="height: 200px;"></div>', unsafe_allow_html=True)
-

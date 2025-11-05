@@ -280,6 +280,7 @@ def on_upload_change():
     """ファイルアップローダーの状態が変わった時に呼ばれるコールバック"""
     uploaded_file = st.session_state.get("xml_uploader")
     if uploaded_file:
+        # spinnerをここに移動
         with st.spinner("XMLファイルを解析中..."):
             parsed_text = parse_premiere_xml(uploaded_file)
             st.session_state["input_text"] = parsed_text
@@ -291,7 +292,6 @@ def on_text_area_change():
 # --- UIレイアウト ---
 col1_main, col2_main = st.columns(2)
 with col1_main:
-    # XMLアップローダー
     st.file_uploader(
         "Premiere ProのシーケンスXML (.xml) をアップロード",
         type=['xml'],
@@ -299,7 +299,6 @@ with col1_main:
         on_change=on_upload_change
     )
     
-    # テキストエリア
     st.text_area(
         "　ここに元原稿をペーストするか、上記からXMLをアップロードしてください。", 
         height=420,
@@ -322,57 +321,80 @@ with col1_opt: n_force_insert = st.checkbox("Ｎ強制挿入", value=True)
 with col2_opt: mm_ss_colon = st.checkbox("ｍｍ：ｓｓ", value=False)
 with col3_opt: ai_check_flag = st.checkbox("誤字脱字チェック(β)", value=False)
 
-# --- 変換実行と結果表示 ---
-if st.session_state["input_text"]:
-    try:
-        current_input = st.session_state["input_text"]
-        initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
-        ai_data = initial_result["ai_data"]
-        block_start_times = initial_result["start_times"]
-        highlight_indices = set()
-        ai_display_text = ""
 
-        if ai_check_flag:
-            with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
-                if not st.session_state.get("ai_result_cache"):
-                    ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
-                    st.session_state["ai_result_cache"] = ai_result_md
-            ai_result_md = st.session_state.get("ai_result_cache", "")
-            if ai_result_md and "問題ありませんでした" not in ai_result_md:
-                new_table_header = "| タイム | 修正提案 | 理由 |\n|---|---|---|"
-                new_table_rows = []
-                for line in ai_result_md.splitlines():
-                    if line.strip().startswith('|') and '---' not in line and 'No.' not in line:
-                        try:
-                            parts = [p.strip() for p in line.strip().strip('|').split('|')]
-                            num_str, suggestion, reason = parts[0], parts[1], parts[2]
-                            index = int(re.search(r'\d+', num_str).group()) - 1
-                            if 0 <= index < len(block_start_times):
-                                highlight_indices.add(index)
-                                start_time = block_start_times[index]
-                                new_table_rows.append(f"| {start_time} | {suggestion} | {reason} |")
-                        except (ValueError, IndexError): continue
-                if new_table_rows: ai_display_text = new_table_header + "\n" + "\n".join(new_table_rows)
-                else: ai_display_text = "AIによる指摘事項はありませんでした。"
-            else: ai_display_text = ai_result_md
+# ===============================================================
+# ▼▼▼ 修正ここから：変換実行と結果表示のロジックを改善 ▼▼▼
+# ===============================================================
+current_input = st.session_state.get("input_text", "")
 
-        final_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon, highlight_indices)
-        
-        with col2_main:
-             st.text_area("　変換完了！コピーしてお使いください", value=final_result["narration_script"], height=500)
-             
-        if ai_check_flag:
-            st.markdown("---")
-            st.subheader("📝 AI校正チェック結果")
-            st.markdown(ai_display_text)
-            
-    except Exception as e:
-        with col2_main:
-            st.error(f"エラーが発生しました: {e}")
-            st.text_area("　", value="", height=500, disabled=True)
-else:
-    with col2_main:
+# 常に右側の列のコンテナを確保
+with col2_main:
+    if current_input:
+        # まず、左のテキストエリアの入力がXML解析からのエラーメッセージでないか確認
+        if current_input.strip().startswith("エラー："):
+            # XML解析エラーの場合、右側には変換処理を行わず、警告を表示
+            st.warning("XMLの解析でエラーが発生しました。左のテキストエリアのエラーメッセージを確認してください。")
+            st.text_area("変換結果", value="", height=500, disabled=True)
+        else:
+            # 正常なテキスト入力なので、変換処理を実行
+            try:
+                initial_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon)
+                ai_data = initial_result["ai_data"]
+                block_start_times = initial_result["start_times"]
+                highlight_indices = set()
+                ai_display_text = ""
+
+                if ai_check_flag and not initial_result["narration_script"].startswith("エラー："):
+                    with st.spinner("Geminiが誤字脱字をチェック中...数分お待ちください🙇"):
+                        if not st.session_state.get("ai_result_cache"):
+                            ai_result_md = check_narration_with_gemini(ai_data, GEMINI_API_KEY)
+                            st.session_state["ai_result_cache"] = ai_result_md
+                    
+                    ai_result_md = st.session_state.get("ai_result_cache", "")
+                    
+                    if ai_result_md and "問題ありませんでした" not in ai_result_md:
+                        new_table_header = "| タイム | 修正提案 | 理由 |\n|---|---|---|"
+                        new_table_rows = []
+                        for line in ai_result_md.splitlines():
+                            if line.strip().startswith('|') and '---' not in line and 'No.' not in line:
+                                try:
+                                    parts = [p.strip() for p in line.strip().strip('|').split('|')]
+                                    num_str, suggestion, reason = parts[0], parts[1], parts[2]
+                                    index = int(re.search(r'\d+', num_str).group()) - 1
+                                    if 0 <= index < len(block_start_times):
+                                        highlight_indices.add(index)
+                                        start_time = block_start_times[index]
+                                        new_table_rows.append(f"| {start_time} | {suggestion} | {reason} |")
+                                except (ValueError, IndexError):
+                                    continue
+                        
+                        if new_table_rows:
+                            ai_display_text = new_table_header + "\n" + "\n".join(new_table_rows)
+                        else:
+                            ai_display_text = "AIによる指摘事項はありませんでした。"
+                    else:
+                        ai_display_text = ai_result_md
+
+                final_result = convert_narration_script(current_input, n_force_insert, mm_ss_colon, highlight_indices)
+                
+                st.text_area("　変換完了！コピーしてお使いください", value=final_result["narration_script"], height=500)
+                
+                # AI校正結果はメインの列の外、下に表示
+                if ai_check_flag and ai_display_text:
+                    st.markdown("---")
+                    st.subheader("📝 AI校正チェック結果")
+                    st.markdown(ai_display_text)
+
+            except Exception as e:
+                st.error(f"変換処理中に予期せぬエラーが発生しました: {e}")
+                st.text_area("変換結果", value="", height=500, disabled=True)
+    else:
+        # 初期状態（入力が何もない場合）
         st.markdown('<div style="height: 500px;"></div>', unsafe_allow_html=True)
+
+# ===============================================================
+# ▲▲▲ 修正ここまで ▲▲▲
+# ===============================================================
             
 # --- フッター ---
 st.markdown("---")
